@@ -208,7 +208,7 @@ if uploaded_file is not None:
         df['Day'] = df[DATE_COLUMN].dt.date
         df['Week'] = df[DATE_COLUMN].dt.to_period('W').astype(str) 
         df['Month'] = df[DATE_COLUMN].dt.to_period('M').astype(str)
-        df['Hour'] = df[DATE_COLUMN].dt.floor('H').astype(str) # NEW: Hourly Column
+        df['Hour'] = df[DATE_COLUMN].dt.floor('H').astype(str) 
 
         bins = [0, 500, 5000, 25000, 100000, float('inf')]
         labels = ['₹1 – ₹500', '₹501 – ₹5,000', '₹5,001 – ₹25,000', '₹25,001 – ₹1,00,000', '₹1,00,001 and above']
@@ -304,7 +304,6 @@ if uploaded_file is not None:
                     'Monthly': {'time_col': 'Month', 'sheets': {}}
                 }
 
-                # Add Hourly if selected
                 if run_hourly and hourly_df is not None and not hourly_df.empty:
                     report_configs['Hourly'] = {'time_col': 'Hour', 'sheets': {}, 'data': hourly_df}
 
@@ -313,15 +312,13 @@ if uploaded_file is not None:
                     'PG': ['pg'],
                     'Bank': ['bankname'],
                     'Paymode+PG': ['paymentmode', 'pg'],
-                    'Paymode+Bank': ['paymentmode', 'bankname'],
-                    'Card Network': ['paymentmode', 'cardtype']
+                    'Paymode+Bank': ['paymentmode', 'bankname']
                 }
 
                 # --- MAIN LOOP ---
                 generated_buffers = {}
                 
                 for report_type, config in report_configs.items():
-                    # Use specific dataframe for Hourly, else global df
                     current_df = config.get('data', df)
                     time_col = config['time_col']
                     time_group = [time_col] if time_col else []
@@ -354,7 +351,10 @@ if uploaded_file is not None:
                              config['sheets'][f'SR by PSP App'] = (time_group + ['paymentmode', 'psp_app'], psp_df)
                     
                     if 'bank_tier' in current_df.columns:
-                         config['sheets'][f'SR by Bank Tier'] = (time_group + ['paymentmode', 'bank_tier'], current_df)
+                         # FILTER: NET_BANKING ONLY
+                         bank_tier_df = current_df[current_df['paymentmode'] == 'NET_BANKING']
+                         if not bank_tier_df.empty:
+                            config['sheets'][f'SR by Bank Tier'] = (time_group + ['paymentmode', 'bank_tier'], bank_tier_df)
 
                     if 'card_category' in current_df.columns:
                         card_cat_df = current_df[current_df['paymentmode'].isin(['CREDIT_CARD', 'DEBIT_CARD'])]
@@ -380,13 +380,22 @@ if uploaded_file is not None:
                                 result.to_excel(writer, sheet_name=safe_sheet_name, index=False)
                                 has_data = True
                         
-                        # Failure Analysis (Using current_df for this report scope)
+                        # --- FAILURE ANALYSIS (DETAILED BY TIME) ---
                         failure_data = current_df[current_df[TX_STATUS_COLUMN] != "SUCCESS"]
                         if not failure_data.empty:
-                            fail_group_cols = [MERCHANT_COLUMN, 'paymentmode', 'txmsg']
+                            # Add Time Column to grouping if it exists (Daily/Weekly/Monthly)
+                            fail_group_cols = [MERCHANT_COLUMN]
+                            if time_col: fail_group_cols.append(time_col)
+                            fail_group_cols.extend(['paymentmode', 'txmsg'])
+                            
                             fail_summary = failure_data.groupby(fail_group_cols, dropna=False)[TX_ID_COLUMN].count().reset_index(name='Volume')
-                            fail_summary = fail_summary.sort_values(by='Volume', ascending=False)
-                            fail_summary.to_excel(writer, sheet_name='Failures Analysis (Summary)', index=False)
+                            
+                            # Sort by time first if applicable, else by Volume
+                            sort_cols = [time_col] if time_col else ['Volume']
+                            ascending_sort = [True] if time_col else [False]
+                            fail_summary = fail_summary.sort_values(by=sort_cols, ascending=ascending_sort)
+                            
+                            fail_summary.to_excel(writer, sheet_name='Failures Analysis', index=False)
                             has_data = True
 
                         if not has_data:
@@ -410,7 +419,6 @@ if uploaded_file is not None:
             with c1:
                 st.download_button(label="🌍 Download Overview Report (Entire Data)", data=st.session_state['overview_report'], file_name="Overview_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
             
-            # Hourly Download Button
             if 'hourly_report' in st.session_state:
                 with c2:
                     st.download_button(label="🕒 Download Hourly Report", data=st.session_state['hourly_report'], file_name="Hourly_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
