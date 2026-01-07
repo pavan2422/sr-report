@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import io
+import plotly.express as px
+import plotly.graph_objects as go
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from openpyxl.formatting.rule import FormulaRule, DataBarRule
@@ -8,7 +10,6 @@ from openpyxl.utils import get_column_letter
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Payment SR Analysis", layout="wide")
-
 st.title("SR Report Generator - Product Ops")
 
 # 1. HYPERLINK
@@ -71,6 +72,9 @@ PSP_MAP = {
 
 TIER_1_BANKS = ['AXIS BANK', 'HDFC BANK', 'ICICI BANK', 'KOTAK MAHINDRA BANK', 'STATE BANK OF INDIA', 'YES BANK LTD']
 
+# MODES CONSIDERED AS "CARDS"
+CARD_MODES = ['CREDIT_CARD', 'DEBIT_CARD', 'CARD', 'PREPAID_CARD', 'CREDIT_CARD_EMI']
+
 # --- HELPER FUNCTIONS ---
 def clean_columns(df):
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
@@ -98,10 +102,8 @@ def compute_sr(data, group_cols, merchant_col, tx_id_col, amount_col, status_col
     ).reset_index()
 
     grouped['Unsuccessful Count'] = grouped['Volume'] - grouped['Success']
-    
     gmv_data = data[data['is_success'] == 1].groupby([merchant_col] + group_cols, dropna=False)[amount_col].sum().reset_index(name='GMV')
     grouped = grouped.merge(gmv_data, on=[merchant_col] + group_cols, how='left').fillna({'GMV': 0})
-
     grouped['SR (%)'] = (grouped['Success'] / grouped['Volume'].replace(0, 1) * 100).round(2)
 
     df_no_drops = data[data[status_col] != 'USER_DROPPED']
@@ -113,7 +115,6 @@ def compute_sr(data, group_cols, merchant_col, tx_id_col, amount_col, status_col
         grouped['SR without User Drops (%)'] = 0.0
 
     grouped['% of Volume (Global)'] = (grouped['Volume'] / total_volume * 100).round(2)
-
     if num_merchants > 1:
         merchant_totals = data.groupby(merchant_col)[tx_id_col].count().reset_index(name='Merchant_Total')
         grouped = grouped.merge(merchant_totals, on=merchant_col, how='left')
@@ -126,10 +127,8 @@ def compute_sr(data, group_cols, merchant_col, tx_id_col, amount_col, status_col
 def compute_mom_change(df, group_cols, merchant_col):
     if df.empty: return df
     group_cols = [c for c in group_cols if c is not None]
-    
     df = df.sort_values([merchant_col] + group_cols)
     key_cols = [c for c in group_cols if c != 'Month' and c != 'Week' and c != 'Hour']
-    
     result = df.copy()
     for metric in ["Volume", "SR (%)"]:
         if metric in result.columns:
@@ -170,140 +169,209 @@ def apply_formatting(buffer):
     final_output.seek(0)
     return final_output
 
-# --- MAIN APP ---
+@st.cache_data
+def preprocess_data(df):
+    cols_to_upper = ['paymentmode', 'txstatus', 'bankname', 'cardtype', 'cardcountry', 'pg', 'txmsg']
+    for col in cols_to_upper:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.upper().str.strip().replace('NAN', None)
 
+    df['txtime'] = pd.to_datetime(df['txtime'], errors='coerce')
+    df.dropna(subset=['txtime'], inplace=True)
+    df['Day'] = df['txtime'].dt.date
+    df['Month'] = df['txtime'].dt.to_period('M').astype(str)
+    df['Week'] = df['txtime'].dt.to_period('W').astype(str)
+    df['Hour'] = df['txtime'].dt.floor('H').astype(str)
+
+    if 'amount' in df.columns:
+        df['amount'] = pd.to_numeric(df['amount'].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
+    else: df['amount'] = 0
+    
+    df['is_success'] = (df['txstatus'] == 'SUCCESS').astype(int)
+    df['is_userdrop'] = (df['txstatus'] == 'USER_DROPPED').astype(int)
+
+    if 'bankname' in df.columns:
+        df['bank_tier'] = df['bankname'].apply(lambda x: 'Tier 1 Bank' if x in TIER_1_BANKS else 'Tier 2 Bank')
+    
+    if 'cardnumber' in df.columns:
+         df['upi_handle'] = df['cardnumber'].astype(str).apply(lambda x: x.split('@')[1] if '@' in x else None).str.lower()
+         df['psp_app'] = df['upi_handle'].map(PSP_MAP).fillna(df['upi_handle'])
+
+    if 'cardcountry' in df.columns:
+        df['card_category'] = df['cardcountry'].apply(lambda x: 'DOMESTIC' if x == 'IN' else 'IPG')
+
+    def categorize(row):
+        mode = row.get('paymentmode')
+        if mode == 'UPI':
+            if pd.notna(row.get('bankname')) and row.get('bankname') != 'NAN': return 'UPI_INTENT'
+            return 'UPI_COLLECT'
+        elif mode in CARD_MODES:
+            geo = 'DOMESTIC' if row.get('cardcountry') == 'IN' else 'INTERNATIONAL'
+            return f"{mode}_{geo}"
+        elif mode == 'NET_BANKING':
+            return 'NB_TIER_1' if row.get('bankname') in TIER_1_BANKS else 'NB_TIER_2'
+        return mode 
+    df['sub_category'] = df.apply(categorize, axis=1)
+
+    return df
+
+# --- RCA HELPER ---
+def get_failure_spike(curr_df, prev_df, group_cols, mode_group):
+    curr_err = curr_df[curr_df['txstatus']!='SUCCESS'].groupby(group_cols).size().reset_index(name='curr_count')
+    prev_err = prev_df[prev_df['txstatus']!='SUCCESS'].groupby(group_cols).size().reset_index(name='prev_count')
+    
+    merged = pd.merge(curr_err, prev_err, on=group_cols, how='outer').fillna(0)
+    merged['spike'] = merged['curr_count'] - merged['prev_count']
+    
+    c_fails_total = len(curr_df[curr_df['txstatus']!='SUCCESS'])
+    p_fails_total = len(prev_df[prev_df['txstatus']!='SUCCESS'])
+    total_fail_increase = c_fails_total - p_fails_total
+    
+    if total_fail_increase > 0:
+        merged['contribution'] = (merged['spike'] / total_fail_increase) * 100
+    else:
+        merged['contribution'] = 0.0
+    
+    context_list = []
+    drill_col = None
+    if mode_group == 'UPI': drill_col = 'sub_category'
+    elif mode_group == 'CARDS': drill_col = 'cardtype'
+    elif mode_group == 'NET_BANKING': drill_col = 'bankname'
+    
+    if drill_col:
+        for index, row in merged.iterrows():
+            reason = row['txmsg']
+            specific_fails = curr_df[(curr_df['txstatus']!='SUCCESS') & (curr_df['txmsg'] == reason)]
+            if not specific_fails.empty:
+                top_affected = specific_fails[drill_col].value_counts().head(3)
+                context_str = " | ".join([f"{k}: {v}" for k, v in top_affected.items()])
+                context_list.append(context_str)
+            else: context_list.append("N/A")
+    else: context_list = ["N/A"] * len(merged)
+
+    merged['Context'] = context_list
+    return merged.sort_values('spike', ascending=False)
+
+def compare_periods(curr_df, prev_df, group_cols):
+    if isinstance(group_cols, str): group_cols = [group_cols]
+    
+    stats_c = curr_df.groupby(group_cols)['is_success'].agg(['count','sum']).reset_index().rename(columns={'count':'Vol_curr', 'sum':'Succ_curr'})
+    stats_p = prev_df.groupby(group_cols)['is_success'].agg(['count','sum']).reset_index().rename(columns={'count':'Vol_prev', 'sum':'Succ_prev'})
+    
+    merged = pd.merge(stats_c, stats_p, on=group_cols, how='outer').fillna(0)
+    
+    merged['SR_curr'] = (merged['Succ_curr'] / merged['Vol_curr'].replace(0,1)) * 100
+    merged['SR_prev'] = (merged['Succ_prev'] / merged['Vol_prev'].replace(0,1)) * 100
+    merged['SR_Delta'] = merged['SR_curr'] - merged['SR_prev']
+    merged['Vol_Delta'] = merged['Vol_curr'] - merged['Vol_prev']
+    
+    return merged.sort_values('SR_Delta')
+
+# Function to color negative deltas red, positive green
+def color_delta(val):
+    if val < 0: color = '#ff4b4b' # Red
+    elif val > 0: color = '#09ab3b' # Green
+    else: color = 'white'
+    return f'color: {color}'
+
+# --- MAIN APP ---
 uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
-if uploaded_file is not None:
-    try:
-        df = pd.read_csv(uploaded_file)
-        df = clean_columns(df)
-        
-        # --- CONSTANTS ---
-        DATE_COLUMN = 'txtime'
-        TX_STATUS_COLUMN = 'txstatus'
-        TX_ID_COLUMN = 'transactionid'
-        AMOUNT_COLUMN = 'amount'
-        MERCHANT_COLUMN = 'merchantid'
+if uploaded_file:
+    with st.spinner("Processing & Cleaning Data..."):
+        raw_df = pd.read_csv(uploaded_file)
+        raw_df = clean_columns(raw_df)
+        df = preprocess_data(raw_df)
 
-        if not all(col in df.columns for col in [DATE_COLUMN, TX_STATUS_COLUMN, TX_ID_COLUMN, MERCHANT_COLUMN]):
-            st.error(f"❌ Missing required columns.")
-            st.stop()
+    tab_report, tab_rca = st.tabs(["📊 Report Generator", "🔍 Insights & RCA"])
 
-        # --- PRE-PROCESSING ---
-        if AMOUNT_COLUMN in df.columns:
-            df[AMOUNT_COLUMN] = df[AMOUNT_COLUMN].astype(str).str.replace(r'[^\d.]', '', regex=True)
-            df[AMOUNT_COLUMN] = pd.to_numeric(df[AMOUNT_COLUMN], errors='coerce').fillna(0)
-        else: df[AMOUNT_COLUMN] = 0
+    # ==========================================
+    # TAB 1: REPORT GENERATOR
+    # ==========================================
+    with tab_report:
+        st.header("Generate Standard Excel Reports")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1: share_with_merchant = st.checkbox("Share with Merchant (Remove PG Data)", value=False)
+        with col_f2: run_hourly = st.checkbox("Get Hourly SR Report")
 
-        df[DATE_COLUMN] = pd.to_datetime(df[DATE_COLUMN], errors='coerce')
-        df.dropna(subset=[DATE_COLUMN], inplace=True)
-        
-        df[TX_STATUS_COLUMN] = df[TX_STATUS_COLUMN].astype(str).str.upper().str.strip()
-        for col in ['paymentmode', 'cardtype', 'pg', 'bankname', 'cardcountry']:
-            if col in df.columns: df[col] = df[col].astype(str).str.upper().str.strip()
-
-        df['is_success'] = (df[TX_STATUS_COLUMN] == 'SUCCESS').astype(int)
-        df['is_userdrop'] = (df[TX_STATUS_COLUMN] == 'USER_DROPPED').astype(int)
-        df['Day'] = df[DATE_COLUMN].dt.date
-        df['Week'] = df[DATE_COLUMN].dt.to_period('W').astype(str) 
-        df['Month'] = df[DATE_COLUMN].dt.to_period('M').astype(str)
-        df['Hour'] = df[DATE_COLUMN].dt.floor('H').astype(str) 
-
-        bins = [0, 500, 5000, 25000, 100000, float('inf')]
-        labels = ['₹1 – ₹500', '₹501 – ₹5,000', '₹5,001 – ₹25,000', '₹25,001 – ₹1,00,000', '₹1,00,001 and above']
-        df['amount_category'] = pd.cut(df[AMOUNT_COLUMN], bins=bins, labels=labels, right=True)
-
-        if 'cardnumber' in df.columns:
-             df['upi_handle'] = df['cardnumber'].astype(str).apply(lambda x: x.split('@')[1] if '@' in x else None).str.lower()
-             df['psp_app'] = df['upi_handle'].map(PSP_MAP).fillna(df['upi_handle'])
-
-        if 'bankname' in df.columns:
-            df['bank_tier'] = df['bankname'].apply(lambda x: 'Tier 1 Bank' if x in TIER_1_BANKS else 'Tier 2 Bank')
-
-        # --- SIDEBAR FILTERS ---
-        st.sidebar.header("Data Settings")
-        
-        share_with_merchant = st.sidebar.checkbox("Share with Merchant (Remove PG Data)", value=False)
+        df_display = df.copy()
         if share_with_merchant:
-            if 'pg' in df.columns:
-                df = df.drop(columns=['pg'])
-                st.sidebar.warning("PG Data removed for external sharing.")
+            if 'pg' in df_display.columns:
+                df_display = df_display.drop(columns=['pg'])
+                st.warning("PG Data removed from reports.")
 
-        # --- HOURLY OPTION ---
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🕒 Hourly Analysis")
-        run_hourly = st.sidebar.checkbox("Get Hourly SR Report")
         hourly_df = None
         if run_hourly:
-            min_d, max_d = df['Day'].min(), df['Day'].max()
-            st.sidebar.markdown("**Select Date for Hourly Analysis:**")
-            hourly_range = st.sidebar.date_input("Date Range (Hourly)", [min_d, max_d], min_value=min_d, max_value=max_d)
+            min_d, max_d = df_display['Day'].min(), df_display['Day'].max()
+            hourly_range = st.date_input("Select Date for Hourly Report", [min_d, max_d], min_value=min_d, max_value=max_d)
             if len(hourly_range) == 2:
-                 hourly_df = df[(df['Day'] >= hourly_range[0]) & (df['Day'] <= hourly_range[1])].copy()
-            else:
-                 st.sidebar.warning("Pick start and end date.")
+                hourly_df = df_display[(df_display['Day'] >= hourly_range[0]) & (df_display['Day'] <= hourly_range[1])].copy()
+            else: st.warning("Please pick a start and end date for Hourly Analysis.")
 
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("Filter Data (General)")
-        use_date_filter = st.sidebar.checkbox("Filter by Date Range", value=False)
-        if use_date_filter:
-            min_date = df['Day'].min()
-            max_date = df['Day'].max()
-            date_range = st.sidebar.date_input("Select Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
-            if len(date_range) == 2:
-                df = df[(df['Day'] >= date_range[0]) & (df['Day'] <= date_range[1])]
+        with st.expander("Filter Data (Date, Merchant, Mode)", expanded=True):
+            use_date_filter = st.checkbox("Filter by Date Range", value=False)
+            if use_date_filter:
+                d_r = st.date_input("Select Date Range", [df_display['Day'].min(), df_display['Day'].max()])
+                if len(d_r) == 2: df_display = df_display[(df_display['Day'] >= d_r[0]) & (df_display['Day'] <= d_r[1])]
 
-        all_merchants = sorted(df[MERCHANT_COLUMN].astype(str).unique().tolist())
-        selected_merchants = st.sidebar.multiselect("Select Merchants", all_merchants, default=all_merchants)
-        if selected_merchants: 
-            df = df[df[MERCHANT_COLUMN].astype(str).isin(selected_merchants)]
-            if hourly_df is not None:
-                hourly_df = hourly_df[hourly_df[MERCHANT_COLUMN].astype(str).isin(selected_merchants)]
+            merchants = sorted([str(x) for x in df_display['merchantid'].unique() if pd.notna(x)])
+            sel_merch = st.multiselect("Select Merchants", merchants, default=[]) # Empty default means ALL
+            
+            # Logic: If nothing selected, use ALL. Else filter.
+            if sel_merch:
+                df_display = df_display[df_display['merchantid'].astype(str).isin(sel_merch)]
+                if hourly_df is not None: hourly_df = hourly_df[hourly_df['merchantid'].astype(str).isin(sel_merch)]
 
-        if 'paymentmode' in df.columns:
-            all_modes = sorted(df['paymentmode'].unique().tolist())
-            selected_modes = st.sidebar.multiselect("Select Payment Modes", all_modes, default=all_modes)
-            if selected_modes:
-                df = df[df['paymentmode'].isin(selected_modes)]
-                if hourly_df is not None: hourly_df = hourly_df[hourly_df['paymentmode'].isin(selected_modes)]
+            if 'paymentmode' in df_display.columns:
+                modes = sorted([str(x) for x in df_display['paymentmode'].unique() if pd.notna(x)])
+                sel_modes = st.multiselect("Select Payment Modes", modes, default=[]) # Empty default
+                
+                if sel_modes:
+                    df_display = df_display[df_display['paymentmode'].isin(sel_modes)]
+                    if hourly_df is not None: hourly_df = hourly_df[hourly_df['paymentmode'].isin(sel_modes)]
 
-                if any(mode in selected_modes for mode in ['CREDIT_CARD', 'DEBIT_CARD', 'CARD']):
-                    st.sidebar.markdown("---")
-                    st.sidebar.subheader("💳 Card Filters")
-                    if 'cardcountry' in df.columns:
-                        df['card_category'] = df['cardcountry'].apply(lambda x: 'DOMESTIC' if x == 'IN' else 'IPG')
-                        if hourly_df is not None: hourly_df['card_category'] = hourly_df['cardcountry'].apply(lambda x: 'DOMESTIC' if x == 'IN' else 'IPG')
+                    if any(mode in sel_modes for mode in CARD_MODES):
+                        st.markdown("---")
+                        st.subheader("💳 Card Filters")
+                        if 'cardcountry' in df_display.columns:
+                            all_cats = sorted([str(x) for x in df_display['card_category'].unique() if pd.notna(x)])
+                            selected_cats = st.multiselect("Select Card Category (Geo)", all_cats, default=[])
+                            if selected_cats:
+                                df_display = df_display[
+                                    (df_display['card_category'].isin(selected_cats)) | 
+                                    (~df_display['paymentmode'].isin(CARD_MODES))
+                                ]
+                                if hourly_df is not None: 
+                                    hourly_df = hourly_df[
+                                        (hourly_df['card_category'].isin(selected_cats)) | 
+                                        (~hourly_df['paymentmode'].isin(CARD_MODES))
+                                    ]
                         
-                        all_cats = sorted(df['card_category'].unique().tolist())
-                        selected_cats = st.sidebar.multiselect("Select Card Category (Geo)", all_cats, default=all_cats)
-                        if selected_cats: 
-                            df = df[df['card_category'].isin(selected_cats)]
-                            if hourly_df is not None: hourly_df = hourly_df[hourly_df['card_category'].isin(selected_cats)]
-                    
-                    if 'cardtype' in df.columns:
-                        all_card_types = sorted(df['cardtype'].unique().tolist())
-                        selected_card_types = st.sidebar.multiselect("Select Card Network", all_card_types, default=all_card_types)
-                        if selected_card_types: 
-                            df = df[df['cardtype'].isin(selected_card_types)]
-                            if hourly_df is not None: hourly_df = hourly_df[hourly_df['cardtype'].isin(selected_card_types)]
+                        if 'cardtype' in df_display.columns:
+                            all_card_types = sorted([str(x) for x in df_display['cardtype'].unique() if pd.notna(x)])
+                            selected_card_types = st.multiselect("Select Card Network", all_card_types, default=[])
+                            if selected_card_types: 
+                                df_display = df_display[
+                                    (df_display['cardtype'].isin(selected_card_types)) | 
+                                    (~df_display['paymentmode'].isin(CARD_MODES))
+                                ]
+                                if hourly_df is not None: 
+                                    hourly_df = hourly_df[
+                                        (hourly_df['cardtype'].isin(selected_card_types)) | 
+                                        (~hourly_df['paymentmode'].isin(CARD_MODES))
+                                    ]
 
-        st.info(f"Ready to analyze **{len(df)}** transactions.")
-        
-        # --- PROCESSING LOGIC ---
-        if st.button("🚀 Run Analysis"):
-            with st.spinner('Generating Reports...'):
-                
-                num_merchants = df[MERCHANT_COLUMN].nunique()
-                
-                # REPORT CONFIGURATIONS
+        st.info(f"Ready to analyze **{len(df_display)}** transactions.")
+
+        if st.button("🚀 Run Report Analysis", key="btn_rep"):
+            with st.spinner('Generating Excel Files...'):
+                num_merchants = df_display['merchantid'].nunique()
                 report_configs = {
                     'Overview': {'time_col': None, 'sheets': {}},
                     'Daily': {'time_col': 'Day', 'sheets': {}},
                     'Weekly': {'time_col': 'Week', 'sheets': {}},
                     'Monthly': {'time_col': 'Month', 'sheets': {}}
                 }
-
                 if run_hourly and hourly_df is not None and not hourly_df.empty:
                     report_configs['Hourly'] = {'time_col': 'Hour', 'sheets': {}, 'data': hourly_df}
 
@@ -315,34 +383,29 @@ if uploaded_file is not None:
                     'Paymode+Bank': ['paymentmode', 'bankname']
                 }
 
-                # --- MAIN LOOP ---
                 generated_buffers = {}
                 
                 for report_type, config in report_configs.items():
-                    current_df = config.get('data', df)
+                    current_df = config.get('data', df_display)
                     time_col = config['time_col']
                     time_group = [time_col] if time_col else []
 
-                    # 1. Base SR
                     if report_type == 'Overview': config['sheets']['SR Overall'] = ([], current_df)
                     else: config['sheets'][f'SR {report_type}'] = (time_group, current_df)
                     
-                    # 2. Base Breakdowns
                     for name, group_cols in base_breakdowns.items():
                         if not all(col in current_df.columns for col in group_cols): continue
-                        dataset_to_use = current_df if name != 'Card Network' else current_df[current_df['paymentmode'].isin(['CREDIT_CARD', 'DEBIT_CARD'])]
-                        config['sheets'][f'SR by {name}'] = (group_cols + time_group, dataset_to_use)
+                        config['sheets'][f'SR by {name}'] = (group_cols + time_group, current_df)
 
-                    # 3. Custom Views
                     config['sheets'][f'SR by Paymode'] = (time_group + ['paymentmode'], current_df)
                     
                     if 'cardtype' in current_df.columns:
-                        card_df = current_df[current_df['paymentmode'].isin(['CREDIT_CARD', 'DEBIT_CARD'])]
+                        card_df = current_df[current_df['paymentmode'].isin(CARD_MODES)]
                         config['sheets'][f'SR by Card Type'] = (time_group + ['paymentmode', 'cardtype'], card_df)
                     
                     if 'upi_handle' in current_df.columns:
-                         handle_df = current_df[current_df['upi_handle'].notna()]
-                         if not handle_df.empty:
+                        handle_df = current_df[current_df['upi_handle'].notna()]
+                        if not handle_df.empty:
                              config['sheets'][f'SR by UPI Handle'] = (time_group + ['paymentmode', 'upi_handle'], handle_df)
                     
                     if 'psp_app' in current_df.columns:
@@ -351,55 +414,40 @@ if uploaded_file is not None:
                              config['sheets'][f'SR by PSP App'] = (time_group + ['paymentmode', 'psp_app'], psp_df)
                     
                     if 'bank_tier' in current_df.columns:
-                         # FILTER: NET_BANKING ONLY
                          bank_tier_df = current_df[current_df['paymentmode'] == 'NET_BANKING']
                          if not bank_tier_df.empty:
                             config['sheets'][f'SR by Bank Tier'] = (time_group + ['paymentmode', 'bank_tier'], bank_tier_df)
 
                     if 'card_category' in current_df.columns:
-                        card_cat_df = current_df[current_df['paymentmode'].isin(['CREDIT_CARD', 'DEBIT_CARD'])]
+                        card_cat_df = current_df[current_df['paymentmode'].isin(CARD_MODES)]
                         if not card_cat_df.empty:
                             config['sheets'][f'SR by Card Geo'] = (time_group + ['paymentmode', 'card_category'], card_cat_df)
-                    
-                    # 4. EXCEL GENERATION
+
                     output_buffer = io.BytesIO()
                     with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
                         has_data = False
-                        
                         for sheet_name, (cols, dataset) in config['sheets'].items():
-                            result = compute_sr(dataset, cols, MERCHANT_COLUMN, TX_ID_COLUMN, AMOUNT_COLUMN, TX_STATUS_COLUMN, num_merchants)
-                            
+                            result = compute_sr(dataset, cols, 'merchantid', 'transactionid', 'amount', 'txstatus', num_merchants)
                             if config['time_col'] and config['time_col'] in result.columns:
                                 result = result.sort_values(by=config['time_col'], ascending=True)
-                            
                             if report_type in ['Monthly', 'Weekly'] and not result.empty:
-                                result = compute_mom_change(result, cols, MERCHANT_COLUMN)
-
-                            safe_sheet_name = sheet_name[:31]
+                                result = compute_mom_change(result, cols, 'merchantid')
                             if not result.empty:
-                                result.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+                                result.to_excel(writer, sheet_name=sheet_name[:31], index=False)
                                 has_data = True
                         
-                        # --- FAILURE ANALYSIS (DETAILED BY TIME) ---
-                        failure_data = current_df[current_df[TX_STATUS_COLUMN] != "SUCCESS"]
-                        if not failure_data.empty:
-                            # Add Time Column to grouping if it exists (Daily/Weekly/Monthly)
-                            fail_group_cols = [MERCHANT_COLUMN]
-                            if time_col: fail_group_cols.append(time_col)
-                            fail_group_cols.extend(['paymentmode', 'txmsg'])
-                            
-                            fail_summary = failure_data.groupby(fail_group_cols, dropna=False)[TX_ID_COLUMN].count().reset_index(name='Volume')
-                            
-                            # Sort by time first if applicable, else by Volume
-                            sort_cols = [time_col] if time_col else ['Volume']
-                            ascending_sort = [True] if time_col else [False]
-                            fail_summary = fail_summary.sort_values(by=sort_cols, ascending=ascending_sort)
-                            
-                            fail_summary.to_excel(writer, sheet_name='Failures Analysis', index=False)
+                        fail_data = current_df[current_df['txstatus'] != "SUCCESS"]
+                        if not fail_data.empty:
+                            fail_cols = ['merchantid']
+                            if time_col: fail_cols.append(time_col)
+                            fail_cols.extend(['paymentmode', 'txmsg'])
+                            fail_summary = fail_data.groupby(fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
+                            sort_c = [time_col] if time_col else ['Volume']
+                            asc_s = [True] if time_col else [False]
+                            fail_summary.sort_values(by=sort_c, ascending=asc_s).to_excel(writer, sheet_name='Failures Analysis', index=False)
                             has_data = True
 
-                        if not has_data:
-                            pd.DataFrame([{"Info": "No data available"}]).to_excel(writer, sheet_name="No Data", index=False)
+                        if not has_data: pd.DataFrame([{"Info": "No data"}]).to_excel(writer, sheet_name="No Data", index=False)
                     
                     generated_buffers[report_type] = apply_formatting(output_buffer)
 
@@ -407,32 +455,183 @@ if uploaded_file is not None:
                 st.session_state['weekly_report'] = generated_buffers['Weekly']
                 st.session_state['monthly_report'] = generated_buffers['Monthly']
                 st.session_state['overview_report'] = generated_buffers['Overview']
-                if 'Hourly' in generated_buffers:
-                    st.session_state['hourly_report'] = generated_buffers['Hourly']
-                
-                st.success("✅ Analysis Complete! Download your reports below.")
+                if 'Hourly' in generated_buffers: st.session_state['hourly_report'] = generated_buffers['Hourly']
+                st.success("✅ Analysis Complete! Download reports below.")
 
-        # --- DOWNLOAD SECTION ---
         if 'daily_report' in st.session_state:
             st.markdown("### 📥 Download Reports")
             c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(label="🌍 Download Overview Report (Entire Data)", data=st.session_state['overview_report'], file_name="Overview_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-            
+            with c1: st.download_button("🌍 Overview Report", st.session_state['overview_report'], "Overview_SR.xlsx", use_container_width=True)
             if 'hourly_report' in st.session_state:
-                with c2:
-                    st.download_button(label="🕒 Download Hourly Report", data=st.session_state['hourly_report'], file_name="Hourly_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-
+                with c2: st.download_button("🕒 Hourly Report", st.session_state['hourly_report'], "Hourly_SR.xlsx", use_container_width=True)
             c3, c4, c5 = st.columns(3)
-            with c3:
-                st.download_button(label="📅 Daily Report", data=st.session_state['daily_report'], file_name="Daily_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            with c4:
-                st.download_button(label="📆 Weekly Report", data=st.session_state['weekly_report'], file_name="Weekly_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            with c5:
-                st.download_button(label="🗓️ Monthly Report", data=st.session_state['monthly_report'], file_name="Monthly_SR_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with c3: st.download_button("📅 Daily Report", st.session_state['daily_report'], "Daily_SR.xlsx")
+            with c4: st.download_button("📆 Weekly Report", st.session_state['weekly_report'], "Weekly_SR.xlsx")
+            with c5: st.download_button("🗓️ Monthly Report", st.session_state['monthly_report'], "Monthly_SR.xlsx")
 
-    except Exception as e:
-        st.error(f"Error: {e}")
-        st.exception(e)
+    # ==========================================
+    # TAB 2: RCA & INSIGHTS
+    # ==========================================
+    with tab_rca:
+        st.header("📉 Automated Root Cause Analysis")
+        days_options = [2, 3, 5, 7, 10, 15, 30]
+        selected_days = st.slider("Select Comparison Period (Last X Days)", min_value=1, max_value=30, value=7)
+        
+        max_date = df['Day'].max()
+        curr_start = max_date - pd.Timedelta(days=selected_days - 1)
+        prev_start = curr_start - pd.Timedelta(days=selected_days)
+        prev_end = curr_start - pd.Timedelta(days=1)
+        st.caption(f"**Current:** {curr_start} to {max_date} | **Previous:** {prev_start} to {prev_end}")
+        
+        curr_df = df[(df['Day'] >= curr_start) & (df['Day'] <= max_date)]
+        prev_df = df[(df['Day'] >= prev_start) & (df['Day'] <= prev_end)]
+        
+        if curr_df.empty or prev_df.empty:
+            st.error("Not enough data for comparison.")
+        else:
+            # --- TOP METRICS WITH GMV ---
+            c_vol = len(curr_df)
+            p_vol = len(prev_df)
+            vol_delta = c_vol - p_vol
+            
+            c_sr = (curr_df['is_success'].sum()/c_vol*100) if c_vol > 0 else 0
+            p_sr = (prev_df['is_success'].sum()/p_vol*100) if p_vol > 0 else 0
+            sr_delta = c_sr - p_sr
+            
+            # GMV Calculation (Ensure 'amount' is numeric)
+            c_gmv = curr_df[curr_df['txstatus']=='SUCCESS']['amount'].sum()
+            p_gmv = prev_df[prev_df['txstatus']=='SUCCESS']['amount'].sum()
+            gmv_delta = c_gmv - p_gmv
+
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("Curr SR", f"{c_sr:.2f}%")
+            m2.metric("Prev SR", f"{p_sr:.2f}%", f"{sr_delta:.2f}%")
+            m3.metric("Curr Vol", f"{c_vol}")
+            m4.metric("Prev Vol", f"{p_vol}", f"{vol_delta}")
+            m5.metric("Curr GMV", f"₹{c_gmv:,.0f}")
+            m6.metric("Prev GMV", f"₹{p_gmv:,.0f}", f"{gmv_delta:,.0f}")
+            
+            st.markdown("---")
+            modes = ['UPI', 'CARDS', 'NET_BANKING']
+            for mode_group in modes:
+                with st.expander(f"Analysis: {mode_group}", expanded=(mode_group=='UPI')):
+                    # Filter Data
+                    if mode_group == 'UPI':
+                        m_curr = curr_df[curr_df['paymentmode']=='UPI']
+                        m_prev = prev_df[prev_df['paymentmode']=='UPI']
+                    elif mode_group == 'CARDS':
+                        m_curr = curr_df[curr_df['paymentmode'].isin(CARD_MODES)]
+                        m_prev = prev_df[prev_df['paymentmode'].isin(CARD_MODES)]
+                    else: 
+                        m_curr = curr_df[curr_df['paymentmode']=='NET_BANKING']
+                        m_prev = prev_df[prev_df['paymentmode']=='NET_BANKING']
+
+                    if m_curr.empty:
+                        st.info("No data for this mode.")
+                        continue
+
+                    # 1. Sub-Category Analysis
+                    stats_merged = compare_periods(m_curr, m_prev, 'sub_category')
+                    worst_sub = stats_merged.sort_values('SR_Delta').head(1)
+                    
+                    c1, c2 = st.columns([1, 1])
+                    with c1:
+                        st.write("**Sub-Category Performance**")
+                        st.dataframe(
+                            stats_merged[['sub_category', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr', 'Vol_prev', 'Vol_Delta']]
+                            .style.format({
+                                'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%',
+                                'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
+                            }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
+                            use_container_width=True, hide_index=True
+                        )
+                        
+                        if not worst_sub.empty and worst_sub['SR_Delta'].values[0] < -1:
+                            culprit = worst_sub['sub_category'].values[0]
+                            drop_val = worst_sub['SR_Delta'].values[0]
+                            st.error(f"🚨 **Issue Detected in {culprit}** (Dropped {drop_val:.2f}%)")
+                        else: st.success("✅ No major sub-category drop.")
+
+                        # UPI Handle Breakdown
+                        if mode_group == 'UPI' and 'upi_handle' in m_curr.columns:
+                            st.markdown("##### 🔍 UPI Handle Breakdown")
+                            handle_stats = compare_periods(m_curr, m_prev, 'upi_handle')
+                            handle_stats = handle_stats.sort_values('Vol_Delta', ascending=True)
+                            st.dataframe(
+                                handle_stats[['upi_handle', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr', 'Vol_prev', 'Vol_Delta']]
+                                .style.format({
+                                    'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
+                                    'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
+                                }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
+                                use_container_width=True, hide_index=True
+                            )
+
+                        # Card Type Breakdown
+                        if mode_group == 'CARDS' and 'cardtype' in m_curr.columns:
+                            st.markdown("##### 🔍 Card Type Breakdown")
+                            card_stats = compare_periods(m_curr, m_prev, ['paymentmode', 'cardtype'])
+                            st.dataframe(
+                                card_stats[['paymentmode', 'cardtype', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr', 'Vol_prev', 'Vol_Delta']]
+                                .style.format({
+                                    'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
+                                    'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
+                                }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
+                                use_container_width=True, hide_index=True
+                            )
+
+                    with c2:
+                        trend = m_curr.groupby('Day').agg(SR=('is_success', 'mean'), Vol=('transactionid', 'count')).reset_index()
+                        trend['SR'] = trend['SR'] * 100
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(x=trend['Day'], y=trend['Vol'], name='Volume', 
+                                             hovertemplate='<b>Vol:</b> %{y:.0f}<extra></extra>',
+                                             marker_color='rgba(135, 206, 250, 0.6)'))
+                        fig.add_trace(go.Scatter(x=trend['Day'], y=trend['SR'], name='SR %', yaxis='y2', 
+                                                 hovertemplate='<b>SR:</b> %{y:.2f}%<extra></extra>',
+                                                 line=dict(color='red', width=3)))
+                        fig.update_layout(
+                            title=f'{mode_group} Trend', 
+                            yaxis=dict(title='Volume'), 
+                            yaxis2=dict(title='SR %', overlaying='y', side='right', range=[0, 100]), 
+                            hovermode="x unified"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    st.subheader("Why did it drop?")
+                    fc1, fc2 = st.columns(2)
+                    with fc1:
+                        st.markdown("**1. PG Performance**")
+                        if 'pg' in m_curr.columns:
+                            pg_merged = compare_periods(m_curr, m_prev, 'pg')
+                            pg_merged = pg_merged.sort_values('SR_Delta', ascending=True)
+                            
+                            st.write("📉 **PGs Performance**")
+                            st.dataframe(
+                                pg_merged[['pg', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr', 'Vol_prev', 'Vol_Delta']]
+                                .style.format({
+                                    'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
+                                    'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
+                                }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
+                                use_container_width=True, hide_index=True
+                            )
+
+                    with fc2:
+                        st.markdown("**2. Error Analysis (Volume Spikes)**")
+                        spikes = get_failure_spike(m_curr, m_prev, ['txmsg'], mode_group)
+                        if not spikes.empty:
+                            disp_spikes = spikes[['txmsg', 'curr_count', 'prev_count', 'spike', 'contribution', 'Context']].copy()
+                            disp_spikes.columns = ['Error Message', 'Curr Vol', 'Prev Vol', 'Vol Spike', 'Contrib %', 'Failure Context']
+                            st.dataframe(
+                                disp_spikes.style.format({
+                                    'Curr Vol': '{:.0f}', 
+                                    'Prev Vol': '{:.0f}', 
+                                    'Vol Spike': '{:.0f}',
+                                    'Contrib %': '{:.2f}%'
+                                }).background_gradient(subset=['Vol Spike'], cmap='Reds'),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                        else: st.info("No specific error spike detected.")
+
 else:
     st.info("👆 Upload CSV to start.")
