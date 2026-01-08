@@ -474,20 +474,33 @@ if uploaded_file:
     # ==========================================
     with tab_rca:
         st.header("📉 Automated Root Cause Analysis")
-        days_options = [2, 3, 5, 7, 10, 15, 30]
-        selected_days = st.slider("Select Comparison Period (Last X Days)", min_value=1, max_value=30, value=7)
         
-        max_date = df['Day'].max()
+        # --- RCA FILTERS ---
+        col_rca_1, col_rca_2 = st.columns(2)
+        with col_rca_1:
+            days_options = [2, 3, 5, 7, 10, 15, 30]
+            selected_days = st.slider("Select Comparison Period (Last X Days)", min_value=1, max_value=30, value=7)
+        with col_rca_2:
+            rca_merchants = sorted([str(x) for x in df['merchantid'].unique() if pd.notna(x)])
+            selected_rca_merch = st.multiselect("Filter Merchant ID (RCA Only)", rca_merchants, default=[])
+
+        # Filter Logic for RCA
+        rca_df = df.copy()
+        if selected_rca_merch:
+            rca_df = rca_df[rca_df['merchantid'].astype(str).isin(selected_rca_merch)]
+
+        # Time Periods
+        max_date = rca_df['Day'].max()
         curr_start = max_date - pd.Timedelta(days=selected_days - 1)
         prev_start = curr_start - pd.Timedelta(days=selected_days)
         prev_end = curr_start - pd.Timedelta(days=1)
         st.caption(f"**Current:** {curr_start} to {max_date} | **Previous:** {prev_start} to {prev_end}")
         
-        curr_df = df[(df['Day'] >= curr_start) & (df['Day'] <= max_date)]
-        prev_df = df[(df['Day'] >= prev_start) & (df['Day'] <= prev_end)]
+        curr_df = rca_df[(rca_df['Day'] >= curr_start) & (rca_df['Day'] <= max_date)]
+        prev_df = rca_df[(rca_df['Day'] >= prev_start) & (rca_df['Day'] <= prev_end)]
         
         if curr_df.empty or prev_df.empty:
-            st.error("Not enough data for comparison.")
+            st.error("Not enough data for comparison in the selected range/merchant.")
         else:
             # --- TOP METRICS WITH GMV ---
             c_vol = len(curr_df)
