@@ -380,7 +380,8 @@ if uploaded_file:
                     'PG': ['pg'],
                     'Bank': ['bankname'],
                     'Paymode+PG': ['paymentmode', 'pg'],
-                    'Paymode+Bank': ['paymentmode', 'bankname']
+                    'Paymode+Bank': ['paymentmode', 'bankname'],
+                    'Paymode+PG+Bank': ['paymentmode', 'pg', 'bankname'] # ADDED DIMENSION
                 }
 
                 generated_buffers = {}
@@ -436,15 +437,27 @@ if uploaded_file:
                                 result.to_excel(writer, sheet_name=sheet_name[:31], index=False)
                                 has_data = True
                         
+                        # --- DETAILED FAILURES (ORIGINAL + NEW BANK LEVEL) ---
                         fail_data = current_df[current_df['txstatus'] != "SUCCESS"]
                         if not fail_data.empty:
+                            # 1. Standard Failures Analysis
                             fail_cols = ['merchantid']
                             if time_col: fail_cols.append(time_col)
                             fail_cols.extend(['paymentmode', 'txmsg'])
                             fail_summary = fail_data.groupby(fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
+                            
                             sort_c = [time_col] if time_col else ['Volume']
                             asc_s = [True] if time_col else [False]
                             fail_summary.sort_values(by=sort_c, ascending=asc_s).to_excel(writer, sheet_name='Failures Analysis', index=False)
+                            
+                            # 2. NEW: Failures by Paymode + Bank
+                            if 'bankname' in fail_data.columns:
+                                bank_fail_cols = ['merchantid', 'paymentmode', 'bankname', 'txmsg']
+                                if time_col: bank_fail_cols.insert(1, time_col)
+                                
+                                bank_fail_summary = fail_data.groupby(bank_fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
+                                bank_fail_summary.sort_values(by='Volume', ascending=False).to_excel(writer, sheet_name='Failures (Paymode+Bank)', index=False)
+
                             has_data = True
 
                         if not has_data: pd.DataFrame([{"Info": "No data"}]).to_excel(writer, sheet_name="No Data", index=False)
