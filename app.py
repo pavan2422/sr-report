@@ -279,7 +279,7 @@ uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
 if uploaded_file:
     with st.spinner("Processing & Cleaning Data..."):
-        raw_df = pd.read_csv(uploaded_file)
+        raw_df = pd.read_csv(uploaded_file, engine="pyarrow", dtype_backend="pyarrow")
         raw_df = clean_columns(raw_df)
         df = preprocess_data(raw_df)
 
