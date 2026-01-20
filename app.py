@@ -21,7 +21,10 @@ CLICK HERE TO GET THE DATA FROM METABASE
 
 st.markdown("---")
 
-# --- PSP MAPPING DICTIONARY ---
+# --- CONSTANTS & MAPPINGS ---
+TIER_1_BANKS = ['AXIS BANK', 'HDFC BANK', 'ICICI BANK', 'KOTAK MAHINDRA BANK', 'STATE BANK OF INDIA', 'YES BANK LTD']
+CARD_MODES = ['CREDIT_CARD', 'DEBIT_CARD', 'CARD', 'PREPAID_CARD', 'CREDIT_CARD_EMI']
+
 PSP_MAP = {
     'abcdicici': 'ABCD (Aditya Birla Capital)', 'abfspay': 'Bajaj Finserv / Markets', 'airtel': 'Airtel Thanks App',
     'allbank': 'Allahabad Bank (Now Indian Bank)', 'amazonpay': 'Amazon Pay', 'andb': 'Andhra Bank (Now Union Bank)',
@@ -69,11 +72,6 @@ PSP_MAP = {
     'yescurie': 'CRED (Curie)', 'yesfam': 'FamPay', 'yesg': 'Groww Pay', 'yesgo': 'Yes Bank',
     'yespay': 'Yes Pay Next', 'yespop': 'POP', 'yestp': 'Third Party App', 'zoicici': 'Zomato', 'ztrbl': 'Zeta'
 }
-
-TIER_1_BANKS = ['AXIS BANK', 'HDFC BANK', 'ICICI BANK', 'KOTAK MAHINDRA BANK', 'STATE BANK OF INDIA', 'YES BANK LTD']
-
-# MODES CONSIDERED AS "CARDS"
-CARD_MODES = ['CREDIT_CARD', 'DEBIT_CARD', 'CARD', 'PREPAID_CARD', 'CREDIT_CARD_EMI']
 
 # --- HELPER FUNCTIONS ---
 def clean_columns(df):
@@ -176,12 +174,17 @@ def preprocess_data(df):
         if col in df.columns:
             df[col] = df[col].astype(str).str.upper().str.strip().replace('NAN', None)
 
-    df['txtime'] = pd.to_datetime(df['txtime'], errors='coerce')
+    # FIXED: Added format='mixed' to prevent memory spikes on date inference
+    df['txtime'] = pd.to_datetime(df['txtime'], errors='coerce', format='mixed')
     df.dropna(subset=['txtime'], inplace=True)
     df['Day'] = df['txtime'].dt.date
     df['Month'] = df['txtime'].dt.to_period('M').astype(str)
     df['Week'] = df['txtime'].dt.to_period('W').astype(str)
-    df['Hour'] = df['txtime'].dt.floor('H').astype(str)
+    # FIXED: Changed 'H' to 'h' to fix deprecation warning
+    df['Hour'] = df['txtime'].dt.floor('h').astype(str)
+
+    # Format Date for Display (e.g. 01-Jan)
+    df['Display_Date'] = df['txtime'].dt.strftime('%d-%b')
 
     if 'amount' in df.columns:
         df['amount'] = pd.to_numeric(df['amount'].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
@@ -189,6 +192,10 @@ def preprocess_data(df):
     
     df['is_success'] = (df['txstatus'] == 'SUCCESS').astype(int)
     df['is_userdrop'] = (df['txstatus'] == 'USER_DROPPED').astype(int)
+    df['is_failed'] = (df['txstatus'] == 'FAILED').astype(int)
+    
+    # Logic for Incomplete/Pending
+    df['is_incomplete'] = df['txstatus'].isin(['PENDING', 'INCOMPLETE', 'FLAGGED', 'CANCELLED']).astype(int)
 
     if 'bankname' in df.columns:
         df['bank_tier'] = df['bankname'].apply(lambda x: 'Tier 1 Bank' if x in TIER_1_BANKS else 'Tier 2 Bank')
@@ -223,6 +230,7 @@ def get_failure_spike(curr_df, prev_df, group_cols, mode_group):
     merged = pd.merge(curr_err, prev_err, on=group_cols, how='outer').fillna(0)
     merged['spike'] = merged['curr_count'] - merged['prev_count']
     
+    # Calculate contribution
     c_fails_total = len(curr_df[curr_df['txstatus']!='SUCCESS'])
     p_fails_total = len(prev_df[prev_df['txstatus']!='SUCCESS'])
     total_fail_increase = c_fails_total - p_fails_total
@@ -232,6 +240,7 @@ def get_failure_spike(curr_df, prev_df, group_cols, mode_group):
     else:
         merged['contribution'] = 0.0
     
+    # Context
     context_list = []
     drill_col = None
     if mode_group == 'UPI': drill_col = 'sub_category'
@@ -254,36 +263,154 @@ def get_failure_spike(curr_df, prev_df, group_cols, mode_group):
 
 def compare_periods(curr_df, prev_df, group_cols):
     if isinstance(group_cols, str): group_cols = [group_cols]
-    
     stats_c = curr_df.groupby(group_cols)['is_success'].agg(['count','sum']).reset_index().rename(columns={'count':'Vol_curr', 'sum':'Succ_curr'})
     stats_p = prev_df.groupby(group_cols)['is_success'].agg(['count','sum']).reset_index().rename(columns={'count':'Vol_prev', 'sum':'Succ_prev'})
-    
     merged = pd.merge(stats_c, stats_p, on=group_cols, how='outer').fillna(0)
-    
     merged['SR_curr'] = (merged['Succ_curr'] / merged['Vol_curr'].replace(0,1)) * 100
     merged['SR_prev'] = (merged['Succ_prev'] / merged['Vol_prev'].replace(0,1)) * 100
     merged['SR_Delta'] = merged['SR_curr'] - merged['SR_prev']
     merged['Vol_Delta'] = merged['Vol_curr'] - merged['Vol_prev']
-    
     return merged.sort_values('SR_Delta')
 
-# Function to color negative deltas red, positive green
 def color_delta(val):
     if val < 0: color = '#ff4b4b' # Red
     elif val > 0: color = '#09ab3b' # Green
     else: color = 'white'
     return f'color: {color}'
 
+# --- NEW: SHORT SUMMARY GENERATOR ---
+def generate_day_summary(curr_df, prev_df):
+    """
+    Generates a 2-line summary string for the day header.
+    """
+    if curr_df.empty: return "No data."
+    
+    # 1. Global Change
+    c_vol = len(curr_df)
+    p_vol = len(prev_df)
+    c_sr = (curr_df['is_success'].sum()/c_vol*100) if c_vol > 0 else 0
+    p_sr = (prev_df['is_success'].sum()/p_vol*100) if p_vol > 0 else 0
+    sr_diff = c_sr - p_sr
+    
+    if sr_diff >= -0.5:
+        return "✅ Performance is stable."
+    
+    # 2. Identify Driver
+    c_ud = len(curr_df[curr_df['is_userdrop']==1])
+    p_ud = len(prev_df[prev_df['is_userdrop']==1])
+    ud_inc = c_ud - p_ud
+    
+    c_fail = len(curr_df[curr_df['is_failed']==1])
+    p_fail = len(prev_df[prev_df['is_failed']==1])
+    fail_inc = c_fail - p_fail
+    
+    reason = "User Drops" if ud_inc > fail_inc else "Technical Failures"
+    
+    # 3. Identify Mode
+    mode_counts = curr_df[curr_df['txstatus']!='SUCCESS']['paymentmode'].value_counts()
+    top_mode = mode_counts.index[0] if not mode_counts.empty else "Unknown"
+    
+    return f"📉 SR dropped by {abs(sr_diff):.1f}% due to increased **{reason}** in **{top_mode}**."
+
+# --- DRILL DOWN RENDERER ---
+def render_metric_tab(curr_df, prev_df, metric_col, title):
+    """
+    Renders the drill down for a specific metric (User Drop / Failed / Incomplete)
+    grouped by Mode -> Least Dimension (Handle/CardType/Bank).
+    Also shows Percentage Contribution and Delta Percentage.
+    """
+    c_count = curr_df[metric_col].sum()
+    p_count = prev_df[metric_col].sum()
+    diff = c_count - p_count
+    
+    c_vol_total = len(curr_df)
+    c_pct = (c_count / c_vol_total * 100) if c_vol_total > 0 else 0
+    
+    p_vol_total = len(prev_df)
+    p_pct = (p_count / p_vol_total * 100) if p_vol_total > 0 else 0
+    pct_diff = c_pct - p_pct
+    
+    status = "📈" if pct_diff > 0 else "📉"
+    st.markdown(f"**{title}: {c_pct:.1f}% ({pct_diff:+.1f}%) {status}**")
+    
+    if diff <= 0 and pct_diff <= 0:
+        st.caption(f"No increase in {title}. (Count: {p_count} -> {c_count})")
+        return
+
+    st.markdown("---")
+    
+    # Check which mode contributed
+    modes = ['UPI', 'CARDS', 'NET_BANKING']
+    
+    for mode in modes:
+        if mode == 'UPI':
+            m_curr = curr_df[curr_df['paymentmode']=='UPI']
+            m_prev = prev_df[prev_df['paymentmode']=='UPI']
+            drill_col = 'upi_handle'
+            drill_name = "Handle"
+        elif mode == 'CARDS':
+            m_curr = curr_df[curr_df['paymentmode'].isin(CARD_MODES)]
+            m_prev = prev_df[prev_df['paymentmode'].isin(CARD_MODES)]
+            drill_col = 'cardtype'
+            drill_name = "Card Type"
+        else:
+            m_curr = curr_df[curr_df['paymentmode']=='NET_BANKING']
+            m_prev = prev_df[prev_df['paymentmode']=='NET_BANKING']
+            drill_col = 'bankname'
+            drill_name = "Bank"
+            
+        if m_curr.empty: continue
+
+        m_c_count = m_curr[metric_col].sum()
+        m_p_count = m_prev[metric_col].sum()
+        m_diff = m_c_count - m_p_count
+        
+        m_c_vol = len(m_curr)
+        m_c_rate = (m_c_count / m_c_vol * 100) if m_c_vol > 0 else 0
+        
+        m_p_vol = len(m_prev)
+        m_p_rate = (m_p_count / m_p_vol * 100) if m_p_vol > 0 else 0
+        
+        if m_diff > 0:
+            c1, c2 = st.columns([1.5, 2])
+            with c1:
+                st.markdown(f"**{mode}**")
+                # Show Previous -> Current Count
+                st.write(f"Count: {int(m_p_count)} → {int(m_c_count)} (+{int(m_diff)})")
+                # Show Previous -> Current Rate (with Delta)
+                st.caption(f"Rate: {m_p_rate:.1f}% → {m_c_rate:.1f}% ({m_c_rate-m_p_rate:+.1f}%)")
+            
+            with c2:
+                # Mini Table for Least Dimension
+                if drill_col in m_curr.columns:
+                    grp_c = m_curr[m_curr[metric_col]==1].groupby(drill_col).size().reset_index(name='Curr')
+                    grp_p = m_prev[m_prev[metric_col]==1].groupby(drill_col).size().reset_index(name='Prev')
+                    merged = pd.merge(grp_c, grp_p, on=drill_col, how='outer').fillna(0)
+                    merged['Inc'] = merged['Curr'] - merged['Prev']
+                    
+                    # Calculate % Contribution relative to TOTAL MODE VOLUME
+                    merged['% Impact'] = (merged['Curr'] / m_c_vol * 100).round(2)
+                    
+                    top = merged.sort_values('Inc', ascending=False).head(3)
+                    
+                    if not top.empty and top.iloc[0]['Inc'] > 0:
+                        st.dataframe(
+                            top.style.format({'Curr':'{:.0f}', 'Prev':'{:.0f}', 'Inc':'{:.0f}', '% Impact':'{:.2f}%'}), 
+                            hide_index=True, 
+                            use_container_width=True
+                        )
+
 # --- MAIN APP ---
 uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
 if uploaded_file:
     with st.spinner("Processing & Cleaning Data..."):
-        raw_df = pd.read_csv(uploaded_file, engine="pyarrow", dtype_backend="pyarrow")
+        # FIXED: Added engine='pyarrow' to fix "Connection reset by peer" (OOM crash)
+        raw_df = pd.read_csv(uploaded_file, engine='pyarrow')
         raw_df = clean_columns(raw_df)
         df = preprocess_data(raw_df)
 
-    tab_report, tab_rca = st.tabs(["📊 Report Generator", "🔍 Insights & RCA"])
+    tab_report, tab_rca, tab_summary = st.tabs(["📊 Report Generator", "🔍 Insights & RCA", "📝 Smart Summary"])
 
     # ==========================================
     # TAB 1: REPORT GENERATOR
@@ -306,7 +433,6 @@ if uploaded_file:
             hourly_range = st.date_input("Select Date for Hourly Report", [min_d, max_d], min_value=min_d, max_value=max_d)
             if len(hourly_range) == 2:
                 hourly_df = df_display[(df_display['Day'] >= hourly_range[0]) & (df_display['Day'] <= hourly_range[1])].copy()
-            else: st.warning("Please pick a start and end date for Hourly Analysis.")
 
         with st.expander("Filter Data (Date, Merchant, Mode)", expanded=True):
             use_date_filter = st.checkbox("Filter by Date Range", value=False)
@@ -315,17 +441,14 @@ if uploaded_file:
                 if len(d_r) == 2: df_display = df_display[(df_display['Day'] >= d_r[0]) & (df_display['Day'] <= d_r[1])]
 
             merchants = sorted([str(x) for x in df_display['merchantid'].unique() if pd.notna(x)])
-            sel_merch = st.multiselect("Select Merchants", merchants, default=[]) # Empty default means ALL
-            
-            # Logic: If nothing selected, use ALL. Else filter.
+            sel_merch = st.multiselect("Select Merchants", merchants, default=[]) 
             if sel_merch:
                 df_display = df_display[df_display['merchantid'].astype(str).isin(sel_merch)]
                 if hourly_df is not None: hourly_df = hourly_df[hourly_df['merchantid'].astype(str).isin(sel_merch)]
 
             if 'paymentmode' in df_display.columns:
                 modes = sorted([str(x) for x in df_display['paymentmode'].unique() if pd.notna(x)])
-                sel_modes = st.multiselect("Select Payment Modes", modes, default=[]) # Empty default
-                
+                sel_modes = st.multiselect("Select Payment Modes", modes, default=[]) 
                 if sel_modes:
                     df_display = df_display[df_display['paymentmode'].isin(sel_modes)]
                     if hourly_df is not None: hourly_df = hourly_df[hourly_df['paymentmode'].isin(sel_modes)]
@@ -381,7 +504,7 @@ if uploaded_file:
                     'Bank': ['bankname'],
                     'Paymode+PG': ['paymentmode', 'pg'],
                     'Paymode+Bank': ['paymentmode', 'bankname'],
-                    'Paymode+PG+Bank': ['paymentmode', 'pg', 'bankname'] # ADDED DIMENSION
+                    'Paymode+PG+Bank': ['paymentmode', 'pg', 'bankname']
                 }
 
                 generated_buffers = {}
@@ -437,27 +560,21 @@ if uploaded_file:
                                 result.to_excel(writer, sheet_name=sheet_name[:31], index=False)
                                 has_data = True
                         
-                        # --- DETAILED FAILURES (ORIGINAL + NEW BANK LEVEL) ---
                         fail_data = current_df[current_df['txstatus'] != "SUCCESS"]
                         if not fail_data.empty:
-                            # 1. Standard Failures Analysis
                             fail_cols = ['merchantid']
                             if time_col: fail_cols.append(time_col)
                             fail_cols.extend(['paymentmode', 'txmsg'])
                             fail_summary = fail_data.groupby(fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
-                            
                             sort_c = [time_col] if time_col else ['Volume']
                             asc_s = [True] if time_col else [False]
                             fail_summary.sort_values(by=sort_c, ascending=asc_s).to_excel(writer, sheet_name='Failures Analysis', index=False)
                             
-                            # 2. NEW: Failures by Paymode + Bank
                             if 'bankname' in fail_data.columns:
                                 bank_fail_cols = ['merchantid', 'paymentmode', 'bankname', 'txmsg']
                                 if time_col: bank_fail_cols.insert(1, time_col)
-                                
                                 bank_fail_summary = fail_data.groupby(bank_fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
                                 bank_fail_summary.sort_values(by='Volume', ascending=False).to_excel(writer, sheet_name='Failures (Paymode+Bank)', index=False)
-
                             has_data = True
 
                         if not has_data: pd.DataFrame([{"Info": "No data"}]).to_excel(writer, sheet_name="No Data", index=False)
@@ -487,8 +604,6 @@ if uploaded_file:
     # ==========================================
     with tab_rca:
         st.header("📉 Automated Root Cause Analysis")
-        
-        # --- RCA FILTERS ---
         col_rca_1, col_rca_2 = st.columns(2)
         with col_rca_1:
             days_options = [2, 3, 5, 7, 10, 15, 30]
@@ -497,12 +612,10 @@ if uploaded_file:
             rca_merchants = sorted([str(x) for x in df['merchantid'].unique() if pd.notna(x)])
             selected_rca_merch = st.multiselect("Filter Merchant ID (RCA Only)", rca_merchants, default=[])
 
-        # Filter Logic for RCA
         rca_df = df.copy()
         if selected_rca_merch:
             rca_df = rca_df[rca_df['merchantid'].astype(str).isin(selected_rca_merch)]
 
-        # Time Periods
         max_date = rca_df['Day'].max()
         curr_start = max_date - pd.Timedelta(days=selected_days - 1)
         prev_start = curr_start - pd.Timedelta(days=selected_days)
@@ -519,12 +632,9 @@ if uploaded_file:
             c_vol = len(curr_df)
             p_vol = len(prev_df)
             vol_delta = c_vol - p_vol
-            
             c_sr = (curr_df['is_success'].sum()/c_vol*100) if c_vol > 0 else 0
             p_sr = (prev_df['is_success'].sum()/p_vol*100) if p_vol > 0 else 0
             sr_delta = c_sr - p_sr
-            
-            # GMV Calculation (Ensure 'amount' is numeric)
             c_gmv = curr_df[curr_df['txstatus']=='SUCCESS']['amount'].sum()
             p_gmv = prev_df[prev_df['txstatus']=='SUCCESS']['amount'].sum()
             gmv_delta = c_gmv - p_gmv
@@ -541,7 +651,6 @@ if uploaded_file:
             modes = ['UPI', 'CARDS', 'NET_BANKING']
             for mode_group in modes:
                 with st.expander(f"Analysis: {mode_group}", expanded=(mode_group=='UPI')):
-                    # Filter Data
                     if mode_group == 'UPI':
                         m_curr = curr_df[curr_df['paymentmode']=='UPI']
                         m_prev = prev_df[prev_df['paymentmode']=='UPI']
@@ -556,7 +665,6 @@ if uploaded_file:
                         st.info("No data for this mode.")
                         continue
 
-                    # 1. Sub-Category Analysis
                     stats_merged = compare_periods(m_curr, m_prev, 'sub_category')
                     worst_sub = stats_merged.sort_values('SR_Delta').head(1)
                     
@@ -571,14 +679,10 @@ if uploaded_file:
                             }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
                             use_container_width=True, hide_index=True
                         )
-                        
                         if not worst_sub.empty and worst_sub['SR_Delta'].values[0] < -1:
-                            culprit = worst_sub['sub_category'].values[0]
-                            drop_val = worst_sub['SR_Delta'].values[0]
-                            st.error(f"🚨 **Issue Detected in {culprit}** (Dropped {drop_val:.2f}%)")
+                            st.error(f"🚨 **Issue Detected in {worst_sub['sub_category'].values[0]}** (Dropped {worst_sub['SR_Delta'].values[0]:.2f}%)")
                         else: st.success("✅ No major sub-category drop.")
 
-                        # UPI Handle Breakdown
                         if mode_group == 'UPI' and 'upi_handle' in m_curr.columns:
                             st.markdown("##### 🔍 UPI Handle Breakdown")
                             handle_stats = compare_periods(m_curr, m_prev, 'upi_handle')
@@ -592,7 +696,6 @@ if uploaded_file:
                                 use_container_width=True, hide_index=True
                             )
 
-                        # Card Type Breakdown
                         if mode_group == 'CARDS' and 'cardtype' in m_curr.columns:
                             st.markdown("##### 🔍 Card Type Breakdown")
                             card_stats = compare_periods(m_curr, m_prev, ['paymentmode', 'cardtype'])
@@ -609,18 +712,9 @@ if uploaded_file:
                         trend = m_curr.groupby('Day').agg(SR=('is_success', 'mean'), Vol=('transactionid', 'count')).reset_index()
                         trend['SR'] = trend['SR'] * 100
                         fig = go.Figure()
-                        fig.add_trace(go.Bar(x=trend['Day'], y=trend['Vol'], name='Volume', 
-                                             hovertemplate='<b>Vol:</b> %{y:.0f}<extra></extra>',
-                                             marker_color='rgba(135, 206, 250, 0.6)'))
-                        fig.add_trace(go.Scatter(x=trend['Day'], y=trend['SR'], name='SR %', yaxis='y2', 
-                                                 hovertemplate='<b>SR:</b> %{y:.2f}%<extra></extra>',
-                                                 line=dict(color='red', width=3)))
-                        fig.update_layout(
-                            title=f'{mode_group} Trend', 
-                            yaxis=dict(title='Volume'), 
-                            yaxis2=dict(title='SR %', overlaying='y', side='right', range=[0, 100]), 
-                            hovermode="x unified"
-                        )
+                        fig.add_trace(go.Bar(x=trend['Day'], y=trend['Vol'], name='Volume', hovertemplate='<b>Vol:</b> %{y:.0f}<extra></extra>', marker_color='rgba(135, 206, 250, 0.6)'))
+                        fig.add_trace(go.Scatter(x=trend['Day'], y=trend['SR'], name='SR %', yaxis='y2', hovertemplate='<b>SR:</b> %{y:.2f}%<extra></extra>', line=dict(color='red', width=3)))
+                        fig.update_layout(title=f'{mode_group} Trend', yaxis=dict(title='Volume'), yaxis2=dict(title='SR %', overlaying='y', side='right', range=[0, 100]), hovermode="x unified")
                         st.plotly_chart(fig, use_container_width=True)
 
                     st.subheader("Why did it drop?")
@@ -630,7 +724,6 @@ if uploaded_file:
                         if 'pg' in m_curr.columns:
                             pg_merged = compare_periods(m_curr, m_prev, 'pg')
                             pg_merged = pg_merged.sort_values('SR_Delta', ascending=True)
-                            
                             st.write("📉 **PGs Performance**")
                             st.dataframe(
                                 pg_merged[['pg', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr', 'Vol_prev', 'Vol_Delta']]
@@ -658,6 +751,81 @@ if uploaded_file:
                                 hide_index=True
                             )
                         else: st.info("No specific error spike detected.")
+
+    # ==========================================
+    # TAB 3: SMART SUMMARY (METRIC FOCUSED)
+    # ==========================================
+    with tab_summary:
+        st.header("📝 Smart Day-over-Day Analysis")
+        
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            start_d = st.date_input("Start Date", value=df['Day'].min())
+        with col_s2:
+            end_d = st.date_input("End Date", value=df['Day'].max())
+            
+        sum_merch = st.multiselect("Filter Merchant (Optional)", sorted([str(x) for x in df['merchantid'].unique() if pd.notna(x)]), default=[])
+        
+        sum_df = df[(df['Day'] >= start_d) & (df['Day'] <= end_d)].copy()
+        if sum_merch:
+            sum_df = sum_df[sum_df['merchantid'].astype(str).isin(sum_merch)]
+            
+        if sum_df.empty:
+            st.error("No data found for selected range.")
+        else:
+            dates = sorted(sum_df['Day'].unique())
+            if len(dates) < 2:
+                st.warning("Need at least 2 days of data.")
+            else:
+                st.subheader(f"📊 Daily Deep Dives ({len(dates)-1} comparisons)")
+                
+                for i in range(1, len(dates)):
+                    curr_date = dates[i]
+                    prev_date = dates[i-1]
+                    
+                    d_curr = sum_df[sum_df['Day'] == curr_date]
+                    d_prev = sum_df[sum_df['Day'] == prev_date]
+                    
+                    # Header Stats
+                    c_sr = (d_curr['is_success'].sum()/len(d_curr)*100) if len(d_curr)>0 else 0
+                    p_sr = (d_prev['is_success'].sum()/len(d_prev)*100) if len(d_prev)>0 else 0
+                    sr_diff = c_sr - p_sr
+                    
+                    c_vol = len(d_curr)
+                    p_vol = len(d_prev)
+                    vol_diff = c_vol - p_vol
+                    
+                    icon = "📉" if sr_diff < -1 else "✅"
+                    
+                    # Generate Summary String
+                    summary_text = generate_day_summary(d_curr, d_prev)
+                    
+                    # Expanded logic
+                    with st.expander(f"{icon} **{curr_date.strftime('%d-%b')}** (vs {prev_date.strftime('%d-%b')}) | SR: {c_sr:.1f}% ({sr_diff:+.1f}%) | Vol: {p_vol} → {c_vol} ({vol_diff:+})"):
+                        
+                        st.info(summary_text)
+                        
+                        t_sr, t_ud, t_fail, t_inc = st.tabs(["📉 Success Rate", "🚧 User Dropped", "💥 Failed", "⏳ Incomplete"])
+                        
+                        # 1. SR Tab
+                        with t_sr:
+                            # Show Modes Table
+                            stats_mode = compare_periods(d_curr, d_prev, 'paymentmode').sort_values('SR_Delta')
+                            st.dataframe(stats_mode[['paymentmode', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr']].style.format({
+                                'SR_curr': '{:.1f}%', 'SR_prev': '{:.1f}%', 'SR_Delta': '{:+.1f}%', 'Vol_curr': '{:.0f}'
+                            }).map(color_delta, subset=['SR_Delta']), use_container_width=True, hide_index=True)
+
+                        # 2. User Dropped Tab
+                        with t_ud:
+                            render_metric_tab(d_curr, d_prev, 'is_userdrop', "User Drops")
+
+                        # 3. Failed Tab
+                        with t_fail:
+                            render_metric_tab(d_curr, d_prev, 'is_failed', "Technical Failures")
+
+                        # 4. Incomplete Tab
+                        with t_inc:
+                            render_metric_tab(d_curr, d_prev, 'is_incomplete', "Incomplete Txns")
 
 else:
     st.info("👆 Upload CSV to start.")
