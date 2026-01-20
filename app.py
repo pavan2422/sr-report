@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import gc  # <--- NEW: Garbage Collector to free memory
 import plotly.express as px
 import plotly.graph_objects as go
 from openpyxl import load_workbook
@@ -167,20 +168,18 @@ def apply_formatting(buffer):
     final_output.seek(0)
     return final_output
 
-@st.cache_data
+# REMOVED CACHE DECORATOR TO SAVE RAM
 def preprocess_data(df):
     cols_to_upper = ['paymentmode', 'txstatus', 'bankname', 'cardtype', 'cardcountry', 'pg', 'txmsg']
     for col in cols_to_upper:
         if col in df.columns:
             df[col] = df[col].astype(str).str.upper().str.strip().replace('NAN', None)
 
-    # FIXED: Added format='mixed' to prevent memory spikes on date inference
     df['txtime'] = pd.to_datetime(df['txtime'], errors='coerce', format='mixed')
     df.dropna(subset=['txtime'], inplace=True)
     df['Day'] = df['txtime'].dt.date
     df['Month'] = df['txtime'].dt.to_period('M').astype(str)
     df['Week'] = df['txtime'].dt.to_period('W').astype(str)
-    # FIXED: Changed 'H' to 'h' to fix deprecation warning
     df['Hour'] = df['txtime'].dt.floor('h').astype(str)
 
     # Format Date for Display (e.g. 01-Jan)
@@ -405,10 +404,16 @@ uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
 if uploaded_file:
     with st.spinner("Processing & Cleaning Data..."):
-        # FIXED: Added engine='pyarrow' to fix "Connection reset by peer" (OOM crash)
-        raw_df = pd.read_csv(uploaded_file, engine='pyarrow')
+        # ⚡️ MEMORY FIX: Use pyarrow types & engine (50% less RAM)
+        raw_df = pd.read_csv(uploaded_file, engine='pyarrow', dtype_backend="pyarrow")
         raw_df = clean_columns(raw_df)
+        
+        # Process the data
         df = preprocess_data(raw_df)
+        
+        # ⚡️ NUCLEAR MEMORY CLEANUP: Delete raw data instantly
+        del raw_df
+        gc.collect()
 
     tab_report, tab_rca, tab_summary = st.tabs(["📊 Report Generator", "🔍 Insights & RCA", "📝 Smart Summary"])
 
