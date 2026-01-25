@@ -720,7 +720,7 @@ if uploaded_file:
                         fig.add_trace(go.Bar(x=trend['Day'], y=trend['Vol'], name='Volume', hovertemplate='<b>Vol:</b> %{y:.0f}<extra></extra>', marker_color='rgba(135, 206, 250, 0.6)'))
                         fig.add_trace(go.Scatter(x=trend['Day'], y=trend['SR'], name='SR %', yaxis='y2', hovertemplate='<b>SR:</b> %{y:.2f}%<extra></extra>', line=dict(color='red', width=3)))
                         fig.update_layout(title=f'{mode_group} Trend', yaxis=dict(title='Volume'), yaxis2=dict(title='SR %', overlaying='y', side='right', range=[0, 100]), hovermode="x unified")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                     st.subheader("Why did it drop?")
                     fc1, fc2 = st.columns(2)
