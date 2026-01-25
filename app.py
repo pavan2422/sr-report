@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import io
 import gc  # <--- NEW: Garbage Collector to free memory
-import plotly.express as px
 import plotly.graph_objects as go
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -404,8 +403,9 @@ uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
 if uploaded_file:
     with st.spinner("Processing & Cleaning Data..."):
-        # ⚡️ MEMORY FIX: Use pyarrow types & engine (50% less RAM)
-        raw_df = pd.read_csv(uploaded_file, engine='pyarrow', dtype_backend="pyarrow")
+        # ⚡️ REMOVED pyarrow engine to avoid crashes
+        # Reverting to default C engine (slower but safer)
+        raw_df = pd.read_csv(uploaded_file, low_memory=False) 
         raw_df = clean_columns(raw_df)
         
         # Process the data
