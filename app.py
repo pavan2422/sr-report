@@ -396,7 +396,7 @@ def render_metric_tab(curr_df, prev_df, metric_col, title):
                         st.dataframe(
                             top.style.format({'Curr':'{:.0f}', 'Prev':'{:.0f}', 'Inc':'{:.0f}', '% Impact':'{:.2f}%'}), 
                             hide_index=True, 
-                            use_container_width=True
+                            width="stretch"
                         )
 
 # --- MAIN APP ---
@@ -538,13 +538,13 @@ if uploaded_file:
                              config['sheets'][f'SR by UPI Handle'] = (time_group + ['paymentmode', 'upi_handle'], handle_df)
                     
                     if 'psp_app' in current_df.columns:
-                         psp_df = current_df[current_df['psp_app'].notna()]
-                         if not psp_df.empty:
+                          psp_df = current_df[current_df['psp_app'].notna()]
+                          if not psp_df.empty:
                              config['sheets'][f'SR by PSP App'] = (time_group + ['paymentmode', 'psp_app'], psp_df)
                     
                     if 'bank_tier' in current_df.columns:
-                         bank_tier_df = current_df[current_df['paymentmode'] == 'NET_BANKING']
-                         if not bank_tier_df.empty:
+                          bank_tier_df = current_df[current_df['paymentmode'] == 'NET_BANKING']
+                          if not bank_tier_df.empty:
                             config['sheets'][f'SR by Bank Tier'] = (time_group + ['paymentmode', 'bank_tier'], bank_tier_df)
 
                     if 'card_category' in current_df.columns:
@@ -682,7 +682,7 @@ if uploaded_file:
                                 'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%',
                                 'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                             }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                            use_container_width=True, hide_index=True
+                            width="stretch", hide_index=True
                         )
                         if not worst_sub.empty and worst_sub['SR_Delta'].values[0] < -1:
                             st.error(f"🚨 **Issue Detected in {worst_sub['sub_category'].values[0]}** (Dropped {worst_sub['SR_Delta'].values[0]:.2f}%)")
@@ -698,7 +698,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="stretch", hide_index=True
                             )
 
                         if mode_group == 'CARDS' and 'cardtype' in m_curr.columns:
@@ -710,7 +710,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="stretch", hide_index=True
                             )
 
                     with c2:
@@ -736,7 +736,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="stretch", hide_index=True
                             )
 
                     with fc2:
@@ -752,7 +752,7 @@ if uploaded_file:
                                     'Vol Spike': '{:.0f}',
                                     'Contrib %': '{:.2f}%'
                                 }).background_gradient(subset=['Vol Spike'], cmap='Reds'),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True
                             )
                         else: st.info("No specific error spike detected.")
@@ -818,7 +818,7 @@ if uploaded_file:
                             stats_mode = compare_periods(d_curr, d_prev, 'paymentmode').sort_values('SR_Delta')
                             st.dataframe(stats_mode[['paymentmode', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr']].style.format({
                                 'SR_curr': '{:.1f}%', 'SR_prev': '{:.1f}%', 'SR_Delta': '{:+.1f}%', 'Vol_curr': '{:.0f}'
-                            }).map(color_delta, subset=['SR_Delta']), use_container_width=True, hide_index=True)
+                            }).map(color_delta, subset=['SR_Delta']), width="stretch", hide_index=True)
 
                         # 2. User Dropped Tab
                         with t_ud:
