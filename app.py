@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
-import gc  # <--- NEW: Garbage Collector to free memory
-import plotly.express as px
+import gc
 import plotly.graph_objects as go
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -168,7 +167,7 @@ def apply_formatting(buffer):
     final_output.seek(0)
     return final_output
 
-# REMOVED CACHE DECORATOR TO SAVE RAM
+@st.cache_data
 def preprocess_data(df):
     cols_to_upper = ['paymentmode', 'txstatus', 'bankname', 'cardtype', 'cardcountry', 'pg', 'txmsg']
     for col in cols_to_upper:
@@ -188,6 +187,17 @@ def preprocess_data(df):
     if 'amount' in df.columns:
         df['amount'] = pd.to_numeric(df['amount'].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
     else: df['amount'] = 0
+    
+    # --- AMOUNT CATEGORY LOGIC ---
+    def get_amt_cat(amt):
+        if amt <= 1000: return '0-1k'
+        elif amt <= 10000: return '1k-10k'
+        elif amt <= 50000: return '10k-50k'
+        elif amt <= 100000: return '50k-1L'
+        elif amt <= 200000: return '1L-2L'
+        else: return '>2L'
+    
+    df['amount_category'] = df['amount'].apply(get_amt_cat)
     
     df['is_success'] = (df['txstatus'] == 'SUCCESS').astype(int)
     df['is_userdrop'] = (df['txstatus'] == 'USER_DROPPED').astype(int)
@@ -277,14 +287,10 @@ def color_delta(val):
     else: color = 'white'
     return f'color: {color}'
 
-# --- NEW: SHORT SUMMARY GENERATOR ---
+# --- SHORT SUMMARY GENERATOR ---
 def generate_day_summary(curr_df, prev_df):
-    """
-    Generates a 2-line summary string for the day header.
-    """
     if curr_df.empty: return "No data."
     
-    # 1. Global Change
     c_vol = len(curr_df)
     p_vol = len(prev_df)
     c_sr = (curr_df['is_success'].sum()/c_vol*100) if c_vol > 0 else 0
@@ -294,7 +300,6 @@ def generate_day_summary(curr_df, prev_df):
     if sr_diff >= -0.5:
         return "✅ Performance is stable."
     
-    # 2. Identify Driver
     c_ud = len(curr_df[curr_df['is_userdrop']==1])
     p_ud = len(prev_df[prev_df['is_userdrop']==1])
     ud_inc = c_ud - p_ud
@@ -304,8 +309,6 @@ def generate_day_summary(curr_df, prev_df):
     fail_inc = c_fail - p_fail
     
     reason = "User Drops" if ud_inc > fail_inc else "Technical Failures"
-    
-    # 3. Identify Mode
     mode_counts = curr_df[curr_df['txstatus']!='SUCCESS']['paymentmode'].value_counts()
     top_mode = mode_counts.index[0] if not mode_counts.empty else "Unknown"
     
@@ -313,11 +316,6 @@ def generate_day_summary(curr_df, prev_df):
 
 # --- DRILL DOWN RENDERER ---
 def render_metric_tab(curr_df, prev_df, metric_col, title):
-    """
-    Renders the drill down for a specific metric (User Drop / Failed / Incomplete)
-    grouped by Mode -> Least Dimension (Handle/CardType/Bank).
-    Also shows Percentage Contribution and Delta Percentage.
-    """
     c_count = curr_df[metric_col].sum()
     p_count = prev_df[metric_col].sum()
     diff = c_count - p_count
@@ -338,7 +336,6 @@ def render_metric_tab(curr_df, prev_df, metric_col, title):
 
     st.markdown("---")
     
-    # Check which mode contributed
     modes = ['UPI', 'CARDS', 'NET_BANKING']
     
     for mode in modes:
@@ -346,17 +343,14 @@ def render_metric_tab(curr_df, prev_df, metric_col, title):
             m_curr = curr_df[curr_df['paymentmode']=='UPI']
             m_prev = prev_df[prev_df['paymentmode']=='UPI']
             drill_col = 'upi_handle'
-            drill_name = "Handle"
         elif mode == 'CARDS':
             m_curr = curr_df[curr_df['paymentmode'].isin(CARD_MODES)]
             m_prev = prev_df[prev_df['paymentmode'].isin(CARD_MODES)]
             drill_col = 'cardtype'
-            drill_name = "Card Type"
         else:
             m_curr = curr_df[curr_df['paymentmode']=='NET_BANKING']
             m_prev = prev_df[prev_df['paymentmode']=='NET_BANKING']
             drill_col = 'bankname'
-            drill_name = "Bank"
             
         if m_curr.empty: continue
 
@@ -380,14 +374,11 @@ def render_metric_tab(curr_df, prev_df, metric_col, title):
                 st.caption(f"Rate: {m_p_rate:.1f}% → {m_c_rate:.1f}% ({m_c_rate-m_p_rate:+.1f}%)")
             
             with c2:
-                # Mini Table for Least Dimension
                 if drill_col in m_curr.columns:
                     grp_c = m_curr[m_curr[metric_col]==1].groupby(drill_col).size().reset_index(name='Curr')
                     grp_p = m_prev[m_prev[metric_col]==1].groupby(drill_col).size().reset_index(name='Prev')
                     merged = pd.merge(grp_c, grp_p, on=drill_col, how='outer').fillna(0)
                     merged['Inc'] = merged['Curr'] - merged['Prev']
-                    
-                    # Calculate % Contribution relative to TOTAL MODE VOLUME
                     merged['% Impact'] = (merged['Curr'] / m_c_vol * 100).round(2)
                     
                     top = merged.sort_values('Inc', ascending=False).head(3)
@@ -396,7 +387,7 @@ def render_metric_tab(curr_df, prev_df, metric_col, title):
                         st.dataframe(
                             top.style.format({'Curr':'{:.0f}', 'Prev':'{:.0f}', 'Inc':'{:.0f}', '% Impact':'{:.2f}%'}), 
                             hide_index=True, 
-                            use_container_width=True
+                            width="content"
                         )
 
 # --- MAIN APP ---
@@ -404,14 +395,10 @@ uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
 
 if uploaded_file:
     with st.spinner("Processing & Cleaning Data..."):
-        # ⚡️ MEMORY FIX: Use pyarrow types & engine (50% less RAM)
-        raw_df = pd.read_csv(uploaded_file, engine='pyarrow', dtype_backend="pyarrow")
+        # ⚡️ REMOVED pyarrow engine to avoid crashes
+        raw_df = pd.read_csv(uploaded_file, low_memory=False) 
         raw_df = clean_columns(raw_df)
-        
-        # Process the data
         df = preprocess_data(raw_df)
-        
-        # ⚡️ NUCLEAR MEMORY CLEANUP: Delete raw data instantly
         del raw_df
         gc.collect()
 
@@ -465,29 +452,15 @@ if uploaded_file:
                             all_cats = sorted([str(x) for x in df_display['card_category'].unique() if pd.notna(x)])
                             selected_cats = st.multiselect("Select Card Category (Geo)", all_cats, default=[])
                             if selected_cats:
-                                df_display = df_display[
-                                    (df_display['card_category'].isin(selected_cats)) | 
-                                    (~df_display['paymentmode'].isin(CARD_MODES))
-                                ]
-                                if hourly_df is not None: 
-                                    hourly_df = hourly_df[
-                                        (hourly_df['card_category'].isin(selected_cats)) | 
-                                        (~hourly_df['paymentmode'].isin(CARD_MODES))
-                                    ]
+                                df_display = df_display[(df_display['card_category'].isin(selected_cats)) | (~df_display['paymentmode'].isin(CARD_MODES))]
+                                if hourly_df is not None: hourly_df = hourly_df[(hourly_df['card_category'].isin(selected_cats)) | (~hourly_df['paymentmode'].isin(CARD_MODES))]
                         
                         if 'cardtype' in df_display.columns:
                             all_card_types = sorted([str(x) for x in df_display['cardtype'].unique() if pd.notna(x)])
                             selected_card_types = st.multiselect("Select Card Network", all_card_types, default=[])
                             if selected_card_types: 
-                                df_display = df_display[
-                                    (df_display['cardtype'].isin(selected_card_types)) | 
-                                    (~df_display['paymentmode'].isin(CARD_MODES))
-                                ]
-                                if hourly_df is not None: 
-                                    hourly_df = hourly_df[
-                                        (hourly_df['cardtype'].isin(selected_card_types)) | 
-                                        (~hourly_df['paymentmode'].isin(CARD_MODES))
-                                    ]
+                                df_display = df_display[(df_display['cardtype'].isin(selected_card_types)) | (~df_display['paymentmode'].isin(CARD_MODES))]
+                                if hourly_df is not None: hourly_df = hourly_df[(hourly_df['cardtype'].isin(selected_card_types)) | (~hourly_df['paymentmode'].isin(CARD_MODES))]
 
         st.info(f"Ready to analyze **{len(df_display)}** transactions.")
 
@@ -551,6 +524,10 @@ if uploaded_file:
                         card_cat_df = current_df[current_df['paymentmode'].isin(CARD_MODES)]
                         if not card_cat_df.empty:
                             config['sheets'][f'SR by Card Geo'] = (time_group + ['paymentmode', 'card_category'], card_cat_df)
+                            
+                    # --- NEW: SR BY AMOUNT CATEGORY ---
+                    if 'amount_category' in current_df.columns:
+                        config['sheets']['SR by Amount Category'] = (time_group + ['paymentmode', 'amount_category'], current_df)
 
                     output_buffer = io.BytesIO()
                     with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
@@ -580,6 +557,14 @@ if uploaded_file:
                                 if time_col: bank_fail_cols.insert(1, time_col)
                                 bank_fail_summary = fail_data.groupby(bank_fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
                                 bank_fail_summary.sort_values(by='Volume', ascending=False).to_excel(writer, sheet_name='Failures (Paymode+Bank)', index=False)
+                            
+                            # --- NEW: FAILURES (PAYMODE+PG+REASON) ---
+                            if 'pg' in fail_data.columns:
+                                pg_fail_cols = ['merchantid', 'paymentmode', 'pg', 'txmsg']
+                                if time_col: pg_fail_cols.insert(1, time_col)
+                                pg_fail_summary = fail_data.groupby(pg_fail_cols, dropna=False)['transactionid'].count().reset_index(name='Volume')
+                                pg_fail_summary.sort_values(by='Volume', ascending=False).to_excel(writer, sheet_name='Failures (Paymode+PG)', index=False)
+
                             has_data = True
 
                         if not has_data: pd.DataFrame([{"Info": "No data"}]).to_excel(writer, sheet_name="No Data", index=False)
@@ -604,9 +589,6 @@ if uploaded_file:
             with c4: st.download_button("📆 Weekly Report", st.session_state['weekly_report'], "Weekly_SR.xlsx")
             with c5: st.download_button("🗓️ Monthly Report", st.session_state['monthly_report'], "Monthly_SR.xlsx")
 
-    # ==========================================
-    # TAB 2: RCA & INSIGHTS
-    # ==========================================
     with tab_rca:
         st.header("📉 Automated Root Cause Analysis")
         col_rca_1, col_rca_2 = st.columns(2)
@@ -633,7 +615,6 @@ if uploaded_file:
         if curr_df.empty or prev_df.empty:
             st.error("Not enough data for comparison in the selected range/merchant.")
         else:
-            # --- TOP METRICS WITH GMV ---
             c_vol = len(curr_df)
             p_vol = len(prev_df)
             vol_delta = c_vol - p_vol
@@ -682,7 +663,7 @@ if uploaded_file:
                                 'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%',
                                 'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                             }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                            use_container_width=True, hide_index=True
+                            width="content", hide_index=True
                         )
                         if not worst_sub.empty and worst_sub['SR_Delta'].values[0] < -1:
                             st.error(f"🚨 **Issue Detected in {worst_sub['sub_category'].values[0]}** (Dropped {worst_sub['SR_Delta'].values[0]:.2f}%)")
@@ -698,7 +679,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="content", hide_index=True
                             )
 
                         if mode_group == 'CARDS' and 'cardtype' in m_curr.columns:
@@ -710,7 +691,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="content", hide_index=True
                             )
 
                     with c2:
@@ -720,7 +701,9 @@ if uploaded_file:
                         fig.add_trace(go.Bar(x=trend['Day'], y=trend['Vol'], name='Volume', hovertemplate='<b>Vol:</b> %{y:.0f}<extra></extra>', marker_color='rgba(135, 206, 250, 0.6)'))
                         fig.add_trace(go.Scatter(x=trend['Day'], y=trend['SR'], name='SR %', yaxis='y2', hovertemplate='<b>SR:</b> %{y:.2f}%<extra></extra>', line=dict(color='red', width=3)))
                         fig.update_layout(title=f'{mode_group} Trend', yaxis=dict(title='Volume'), yaxis2=dict(title='SR %', overlaying='y', side='right', range=[0, 100]), hovermode="x unified")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar": False}
+)
+
 
                     st.subheader("Why did it drop?")
                     fc1, fc2 = st.columns(2)
@@ -736,7 +719,7 @@ if uploaded_file:
                                     'SR_curr': '{:.2f}%', 'SR_prev': '{:.2f}%', 'SR_Delta': '{:.2f}%', 
                                     'Vol_curr': '{:.0f}', 'Vol_prev': '{:.0f}', 'Vol_Delta': '{:.0f}'
                                 }).map(color_delta, subset=['SR_Delta', 'Vol_Delta']),
-                                use_container_width=True, hide_index=True
+                                width="content", hide_index=True
                             )
 
                     with fc2:
@@ -752,7 +735,7 @@ if uploaded_file:
                                     'Vol Spike': '{:.0f}',
                                     'Contrib %': '{:.2f}%'
                                 }).background_gradient(subset=['Vol Spike'], cmap='Reds'),
-                                use_container_width=True,
+                                width="content",
                                 hide_index=True
                             )
                         else: st.info("No specific error spike detected.")
@@ -818,7 +801,7 @@ if uploaded_file:
                             stats_mode = compare_periods(d_curr, d_prev, 'paymentmode').sort_values('SR_Delta')
                             st.dataframe(stats_mode[['paymentmode', 'SR_curr', 'SR_prev', 'SR_Delta', 'Vol_curr']].style.format({
                                 'SR_curr': '{:.1f}%', 'SR_prev': '{:.1f}%', 'SR_Delta': '{:+.1f}%', 'Vol_curr': '{:.0f}'
-                            }).map(color_delta, subset=['SR_Delta']), use_container_width=True, hide_index=True)
+                            }).map(color_delta, subset=['SR_Delta']), width="content", hide_index=True)
 
                         # 2. User Dropped Tab
                         with t_ud:
