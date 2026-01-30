@@ -581,9 +581,9 @@ if uploaded_file:
         if 'daily_report' in st.session_state:
             st.markdown("### 📥 Download Reports")
             c1, c2 = st.columns(2)
-            with c1: st.download_button("🌍 Overview Report", st.session_state['overview_report'], "Overview_SR.xlsx", use_container_width=True)
+            with c1: st.download_button("🌍 Overview Report", st.session_state['overview_report'], "Overview_SR.xlsx", width='stretch')
             if 'hourly_report' in st.session_state:
-                with c2: st.download_button("🕒 Hourly Report", st.session_state['hourly_report'], "Hourly_SR.xlsx", use_container_width=True)
+                with c2: st.download_button("🕒 Hourly Report", st.session_state['hourly_report'], "Hourly_SR.xlsx", width='stretch')
             c3, c4, c5 = st.columns(3)
             with c3: st.download_button("📅 Daily Report", st.session_state['daily_report'], "Daily_SR.xlsx")
             with c4: st.download_button("📆 Weekly Report", st.session_state['weekly_report'], "Weekly_SR.xlsx")
