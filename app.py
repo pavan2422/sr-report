@@ -1136,5 +1136,5 @@ def render_report_tab(df: pd.DataFrame):
                         with t_inc:
                             render_metric_tab(d_curr, d_prev, 'is_incomplete', "Incomplete Txns")
 
-else:
+
     st.info("👆 Upload CSV to start.")
