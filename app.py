@@ -67,18 +67,12 @@ st.title("SR Report Generator - Product Ops")
 
 
 st.markdown("""
-
-<a href="https://metabase.cashfree.com/question/23625-sr-report-data?merchantid=&start_date=&end_date="
-
-   target="_blank" style="font-size:18px;font-weight:bold;">
-
+<a href="https://metabase.cashfree.com/question/23625-sr-report-data?merchantid=&start_date=&end_date=&paymentmode=NET_BANKING&paymentmode=DEBIT_CARD&paymentmode=UPI&paymentmode=CREDIT_CARD" 
+   target="_blank" 
+   style="font-size:18px;font-weight:bold; text-decoration:none;">
 CLICK HERE TO GET THE DATA FROM METABASE
-
 </a>
-
 """, unsafe_allow_html=True)
-
-st.markdown("---")
 
 
 
