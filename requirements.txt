@@ -5,3 +5,4 @@ plotly
 matplotlib
 pyarrow
 polars
+polars<2
